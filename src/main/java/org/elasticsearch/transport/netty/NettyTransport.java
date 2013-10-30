@@ -49,6 +49,7 @@ import org.elasticsearch.common.util.concurrent.KeyedLock;
 import org.elasticsearch.monitor.jvm.JvmInfo;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.transport.*;
+import org.elasticsearch.transport.netty.ssl.*;
 import org.elasticsearch.transport.support.TransportStatus;
 import org.jboss.netty.bootstrap.ClientBootstrap;
 import org.jboss.netty.bootstrap.ServerBootstrap;
@@ -122,6 +123,14 @@ public class NettyTransport extends AbstractLifecycleComponent<Transport> implem
     final Boolean tcpKeepAlive;
 
     final Boolean reuseAddress;
+    
+    final boolean ssl;    
+    final String sslKeyStore;    
+    final String sslKeyStorePassword;    
+    final String sslKeyStoreAlgorithm;    
+    final String sslTrustStore;    
+    final String sslTrustStorePassword;    
+    final String sslTrustStoreAlgorithm;
 
     final ByteSizeValue tcpSendBufferSize;
     final ByteSizeValue tcpReceiveBufferSize;
@@ -221,8 +230,16 @@ public class NettyTransport extends AbstractLifecycleComponent<Transport> implem
             receiveBufferSizePredictorFactory = new AdaptiveReceiveBufferSizePredictorFactory((int) receivePredictorMin.bytes(), (int) receivePredictorMin.bytes(), (int) receivePredictorMax.bytes());
         }
 
-        logger.debug("using worker_count[{}], port[{}], bind_host[{}], publish_host[{}], compress[{}], connect_timeout[{}], connections_per_node[{}/{}/{}/{}/{}], receive_predictor[{}->{}]",
-                workerCount, port, bindHost, publishHost, compress, connectTimeout, connectionsPerNodeRecovery, connectionsPerNodeBulk, connectionsPerNodeReg, connectionsPerNodeState, connectionsPerNodePing, receivePredictorMin, receivePredictorMax);
+        this.ssl = settings.getAsBoolean("transport.tcp.ssl", false);
+        this.sslKeyStore = settings.get("transport.tcp.ssl.keystore", System.getProperty("javax.net.ssl.keyStore"));
+        this.sslKeyStorePassword = settings.get("transport.tcp.ssl.keystore_password", System.getProperty("javax.net.ssl.keyStorePassword"));
+        this.sslKeyStoreAlgorithm = settings.get("transport.tcp.ssl.keystore_algorithm", System.getProperty("ssl.KeyManagerFactory.algorithm"));
+        this.sslTrustStore = settings.get("transport.tcp.ssl.truststore", System.getProperty("javax.net.ssl.trustStore"));
+        this.sslTrustStorePassword = settings.get("transport.tcp.ssl.truststore_password", System.getProperty("javax.net.ssl.trustStorePassword"));
+        this.sslTrustStoreAlgorithm = settings.get("ransport.tcp.ssl.truststore_algorithm", System.getProperty("ssl.TrustManagerFactory.algorithm"));
+
+        logger.debug("using worker_count[{}], port[{}], bind_host[{}], publish_host[{}], compress[{}], connect_timeout[{}], connections_per_node[{}/{}/{}/{}/{}], receive_predictor[{}->{}], ssl[{}]",
+                workerCount, port, bindHost, publishHost, compress, connectTimeout, connectionsPerNodeRecovery, connectionsPerNodeBulk, connectionsPerNodeReg, connectionsPerNodeState, connectionsPerNodePing, receivePredictorMin, receivePredictorMax, ssl);
     }
 
     public Settings settings() {
@@ -253,26 +270,34 @@ public class NettyTransport extends AbstractLifecycleComponent<Transport> implem
                     new NioWorkerPool(Executors.newCachedThreadPool(daemonThreadFactory(settings, "transport_client_worker")), workerCount),
                     new HashedWheelTimer(daemonThreadFactory(settings, "transport_client_timer"))));
         }
-        ChannelPipelineFactory clientPipelineFactory = new ChannelPipelineFactory() {
-            @Override
-            public ChannelPipeline getPipeline() throws Exception {
-                ChannelPipeline pipeline = Channels.pipeline();
-                SizeHeaderFrameDecoder sizeHeader = new SizeHeaderFrameDecoder();
-                if (maxCumulationBufferCapacity != null) {
-                    if (maxCumulationBufferCapacity.bytes() > Integer.MAX_VALUE) {
-                        sizeHeader.setMaxCumulationBufferCapacity(Integer.MAX_VALUE);
-                    } else {
-                        sizeHeader.setMaxCumulationBufferCapacity((int) maxCumulationBufferCapacity.bytes());
+        ChannelPipelineFactory clientPipelineFactory = null;
+        if (ssl) {
+        	clientPipelineFactory = new SecureClientChannelPipelineFactory(new SecureMessageChannelHandler(NettyTransport.this, logger),
+        																	sslKeyStore, sslKeyStorePassword, sslKeyStoreAlgorithm,
+        																	sslTrustStore, sslTrustStorePassword, sslTrustStoreAlgorithm,
+        																	maxCumulationBufferCapacity, maxCompositeBufferComponents);
+        } else {
+        	clientPipelineFactory = new ChannelPipelineFactory() {
+                @Override
+                public ChannelPipeline getPipeline() throws Exception {
+                    ChannelPipeline pipeline = Channels.pipeline();
+                    SizeHeaderFrameDecoder sizeHeader = new SizeHeaderFrameDecoder();
+                    if (maxCumulationBufferCapacity != null) {
+                        if (maxCumulationBufferCapacity.bytes() > Integer.MAX_VALUE) {
+                            sizeHeader.setMaxCumulationBufferCapacity(Integer.MAX_VALUE);
+                        } else {
+                            sizeHeader.setMaxCumulationBufferCapacity((int) maxCumulationBufferCapacity.bytes());
+                        }
                     }
+                    if (maxCompositeBufferComponents != -1) {
+                        sizeHeader.setMaxCumulationBufferComponents(maxCompositeBufferComponents);
+                    }
+                    pipeline.addLast("size", sizeHeader);
+                    pipeline.addLast("dispatcher", new MessageChannelHandler(NettyTransport.this, logger));
+                    return pipeline;
                 }
-                if (maxCompositeBufferComponents != -1) {
-                    sizeHeader.setMaxCumulationBufferComponents(maxCompositeBufferComponents);
-                }
-                pipeline.addLast("size", sizeHeader);
-                pipeline.addLast("dispatcher", new MessageChannelHandler(NettyTransport.this, logger));
-                return pipeline;
-            }
-        };
+        	};
+        }
         clientBootstrap.setPipelineFactory(clientPipelineFactory);
         clientBootstrap.setOption("connectTimeoutMillis", connectTimeout.millis());
         if (tcpNoDelay != null) {
@@ -308,27 +333,35 @@ public class NettyTransport extends AbstractLifecycleComponent<Transport> implem
                     Executors.newCachedThreadPool(daemonThreadFactory(settings, "transport_server_worker")),
                     workerCount));
         }
-        ChannelPipelineFactory serverPipelineFactory = new ChannelPipelineFactory() {
-            @Override
-            public ChannelPipeline getPipeline() throws Exception {
-                ChannelPipeline pipeline = Channels.pipeline();
-                pipeline.addLast("openChannels", serverOpenChannels);
-                SizeHeaderFrameDecoder sizeHeader = new SizeHeaderFrameDecoder();
-                if (maxCumulationBufferCapacity != null) {
-                    if (maxCumulationBufferCapacity.bytes() > Integer.MAX_VALUE) {
-                        sizeHeader.setMaxCumulationBufferCapacity(Integer.MAX_VALUE);
-                    } else {
-                        sizeHeader.setMaxCumulationBufferCapacity((int) maxCumulationBufferCapacity.bytes());
-                    }
-                }
-                if (maxCompositeBufferComponents != -1) {
-                    sizeHeader.setMaxCumulationBufferComponents(maxCompositeBufferComponents);
-                }
-                pipeline.addLast("size", sizeHeader);
-                pipeline.addLast("dispatcher", new MessageChannelHandler(NettyTransport.this, logger));
-                return pipeline;
-            }
-        };
+        ChannelPipelineFactory serverPipelineFactory = null;
+		if (ssl) {
+			serverPipelineFactory = serverPipelineFactory = new SecureServerChannelPipelineFactory(new SecureMessageChannelHandler(NettyTransport.this, logger), serverOpenChannels,
+																									sslKeyStore, sslKeyStorePassword, sslKeyStoreAlgorithm,
+																									sslTrustStore, sslTrustStorePassword, sslTrustStoreAlgorithm,
+																									maxCumulationBufferCapacity, maxCompositeBufferComponents);
+		} else {
+			serverPipelineFactory =  new ChannelPipelineFactory() {
+	            @Override
+	            public ChannelPipeline getPipeline() throws Exception {
+	                ChannelPipeline pipeline = Channels.pipeline();
+	                pipeline.addLast("openChannels", serverOpenChannels);
+	                SizeHeaderFrameDecoder sizeHeader = new SizeHeaderFrameDecoder();
+	                if (maxCumulationBufferCapacity != null) {
+	                    if (maxCumulationBufferCapacity.bytes() > Integer.MAX_VALUE) {
+	                        sizeHeader.setMaxCumulationBufferCapacity(Integer.MAX_VALUE);
+	                    } else {
+	                        sizeHeader.setMaxCumulationBufferCapacity((int) maxCumulationBufferCapacity.bytes());
+	                    }
+	                }
+	                if (maxCompositeBufferComponents != -1) {
+	                    sizeHeader.setMaxCumulationBufferComponents(maxCompositeBufferComponents);
+	                }
+	                pipeline.addLast("size", sizeHeader);
+	                pipeline.addLast("dispatcher", new MessageChannelHandler(NettyTransport.this, logger));
+	                return pipeline;
+	            }
+	        };
+		}       
         serverBootstrap.setPipelineFactory(serverPipelineFactory);
         if (tcpNoDelay != null) {
             serverBootstrap.setOption("child.tcpNoDelay", tcpNoDelay);
